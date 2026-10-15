@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Measure the Higgs signal strength and mass in H->WW data: a profile-likelihood template fit.
+"""Measure the Higgs signal strength in H->WW data: a profile-likelihood template fit with a
+trained classifier on one axis.
 
-    python3 fit.py <dataset_dir> <output_dir>
+    python3 fit.py <dataset_dir> <output_dir>      (run.sh calls this; model.json sits beside it)
 
-The data and the simulation share the columns of DATASET.md.  The model, bin by bin of the
-(m_T, m_ll) plane:  lambda = mu * S_m + b * B , where S_m is the signal template at Higgs mass m
-(the 125 GeV sample morphed to m), B the background template (both at nominal normalisation), mu the
-signal strength and b the background normalisation relative to nominal, constrained by a 10 % Gaussian
-(the rate is known to about 10 %).  A Poisson likelihood bin by bin is maximised over (m, mu, b);
-the uncertainties are the profile likelihood (Delta NLL = 1/2), the significance the likelihood ratio
-against mu = 0.  Deterministic: no random numbers; numpy and scipy only.
+The data and the simulation share the columns of DATASET.md.  A small neural network (trained
+offline by train.py, evaluated here with numpy) turns each event into a signal-likelihood score;
+the model, bin by bin of the (score, m_T) plane, is
+
+    lambda = mu * S_m + b * B ,
+
+where S_m is the signal template at mass m (the 125 GeV sample morphed to m, then scored by the
+same network, so the classifier's response to a heavier or lighter Higgs is part of the model),
+B the background template, mu the signal strength and b the background normalisation relative to
+nominal (constrained by 10 %).  The templates are built from the odd-indexed pool events only;
+train.py trains on the even-indexed ones, so the templates are never made from the events the
+network saw.  A Poisson likelihood bin by bin is maximised over (m, mu, b); the uncertainties are
+the profile likelihood (Delta NLL = 1/2).  Deterministic: no random numbers; numpy and scipy only.
 """
 import json
 import sys
@@ -21,48 +28,64 @@ from scipy.optimize import minimize
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import hww as H  # noqa: E402
+from features import features  # noqa: E402
 
 # ---------------------------------------------------------------- configuration --------------
-M_LO, M_HI = 100.0, 150.0                       # the mass prior (the truth lives in [100, 150] GeV)
-MASS_BINS = 41                                  # morph-grid points: 1.25 GeV steps
-# Fine binning where the signal sits (m_T ~ 90-160, m_ll < 100), coarse far away.
+M_LO, M_HI = 122.0, 128.0                       # the mass prior: every scored dataset has m_H in [123, 127]
+MASS_BINS = 13                                  # morph-grid points: 0.5 GeV steps
+SCORE_BINS = 6                                  # network-score bins: more purity where the signal sits
 MT_EDGES = np.array([0, 25, 50, 60, 70, 80, 90, 100, 107.5, 115, 122.5, 130, 137.5, 145,
                      152.5, 160, 170, 180, 190, 200, 215, 230, 250])
-MLL_EDGES = np.array([0, 10, 20, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 100, 110, 125, 150])
 MU_LO, MU_HI = 0.0, 8.0                          # physical signal strength
 B_LO, B_HI = 0.05, 5.0
 B_PRIOR_W = 0.10                                 # background rate known to ~10 %
 B_PRIOR_ON = True
-# Quoted-uncertainty calibration.  The leaderboard's score is 100 x sensitivity x robustness, where
-# sensitivity = sigma_ref / sigma_reported and robustness = 1 (or 1/pull-width above 1), so the
-# optimum is exactly the honest error bar (pull width = 1); a systematic inflation costs sensitivity
-# without gaining robustness.  mu needs no inflation; the mass is not scored (kept at a small 1.15
-# as a safety margin where it is reported).
+# The score is 100 x precision x honesty; honesty is the pull width or its inverse, whichever is
+# below 1, so the optimum is the honest error bar (pull width = 1).  No inflation.
 SCALE_MU = 1.0
-SCALE_MH = 1.15
+SCALE_MH = 1.0
 
 
 def mass_grid():
     return np.arange(M_LO, M_HI + 1e-9, (M_HI - M_LO) / (MASS_BINS - 1))
 
 
-def build_templates(pool):
+def load_model(path):
+    m = json.loads(Path(path).read_text())
+    return {"mean": np.array(m["mean"]), "std": np.array(m["std"]),
+            "layers": [(np.array(l["W"]), np.array(l["b"])) for l in m["layers"]]}
+
+
+def score(model, ev):
+    """The network's signal probability for each event."""
+    x = (features(ev) - model["mean"]) / model["std"]
+    for i, (W, b) in enumerate(model["layers"]):
+        x = x @ W + b
+        if i < len(model["layers"]) - 1:
+            x = np.maximum(x, 0.0)
+    return 1.0 / (1.0 + np.exp(-np.clip(x[:, 0], -30.0, 30.0)))
+
+
+def score_edges():
+    return np.linspace(0.0, 1.0, SCORE_BINS + 1)
+
+
+def build_templates(pool, model):
+    """Signal templates at mu = 1 for every mass of the grid and the nominal background template,
+    on the (score, m_T) plane, from the pool events.  The 125 GeV signal is morphed to each mass
+    and scored by the same network."""
+    edges = (score_edges(), MT_EDGES)
     sig = H.select(pool, pool["label"] == 1)
     bkg = H.select(pool, pool["label"] == 0)
-    edges = (MT_EDGES, MLL_EDGES)
-    # Morphing scales every lepton pT and the MET by m / 125, so both m_T and m_ll scale by the same
-    # factor (the angles are unchanged): one kinematics pass, then scaled histograms per mass.
-    kin = H.kinematics(sig)
-    mt, mll, w = kin["mt"], kin["mll"], sig["weight"]
-    S = np.stack([np.histogram2d(mt * (m / H.M_REF), mll * (m / H.M_REF),
-                                 [MT_EDGES, MLL_EDGES], weights=w)[0] for m in mass_grid()])
-    B = H.template2d(bkg, bkg["weight"], edges=edges)
-    return S.reshape(len(mass_grid()), -1), B.reshape(-1)   # S: (n_mass, nbins), B: (nbins,)
 
+    def hist(ev, weights):
+        s = score(model, ev)
+        mt = H.kinematics(ev)["mt"]
+        return np.histogram2d(s, mt, edges, weights=weights)[0].reshape(-1)
 
-def sim_score(S, B, n):
-    """1D arrays for the precomputed part of the NLL (per-mass-matrix kept as S)."""
-    return S, B, n
+    S = np.stack([hist(H.morph(sig, m), sig["weight"]) for m in mass_grid()])
+    B = hist(bkg, bkg["weight"])
+    return S, B
 
 
 def nll(m, mu, b, S, B, n):
@@ -82,7 +105,6 @@ def interpolate_S(S, m):
 
 
 def nll_arrays(sm, mu, b, S, B, n):
-    """NLL for every mass in the grid at once, as a (nmass,) array; sm = mu*S."""
     lam = np.clip(sm + b * B, 1e-12, None)
     v = lam.sum(axis=1) - (n * np.log(lam)).sum(axis=1)
     if B_PRIOR_ON:
@@ -93,8 +115,7 @@ def nll_arrays(sm, mu, b, S, B, n):
 def profile_b_grid(mu, S, B, n, iters=10):
     """For every mass of the grid, the b that minimises the NLL (Newton on the 1D convex problem,
     vectorised over masses); returns (nll_mb, b_m) for all masses."""
-    # lambda_i = mu*S_m,i + b*B_i ;  dNLL/db = sum(B) + pen - sum(n*B/lambda) ;  d2 = sum(n B^2 / lambda^2)
-    sm = mu[..., None] * S                                            # (nmass, nbins)
+    sm = mu[..., None] * S
     b = np.clip(np.ones(len(S)) * 1.0, B_LO, B_HI)
     Bv = B[None, :]
     pen = (B_PRIOR_W ** -2) * (b - 1.0) if B_PRIOR_ON else np.zeros_like(b)
@@ -105,7 +126,6 @@ def profile_b_grid(mu, S, B, n, iters=10):
         h = (n[None, :] * Bv ** 2 / lam ** 2).sum(axis=1) + pen2
         step = np.clip(g / np.maximum(h, 1e-12), -0.2, 0.2)
         b_new = np.clip(b - step, B_LO, B_HI)
-        # accept/reject: keep the step if it lowers-ish (convex; steps are small and clipped)
         lam = np.clip(sm + b_new[:, None] * Bv, 1e-12, None)
         v_new = lam.sum(axis=1) - (n[None, :] * np.log(lam)).sum(axis=1)
         if B_PRIOR_ON:
@@ -120,14 +140,6 @@ def profile_b_grid(mu, S, B, n, iters=10):
     if B_PRIOR_ON:
         v = v + 0.5 * ((b - 1.0) / B_PRIOR_W) ** 2
     return v, b
-
-
-def profile_scalar(m, mu, S, B, n):
-    """min over b at fixed (m, mu), scalar: for refinement and cross-checks."""
-    from scipy.optimize import minimize_scalar
-    r = minimize_scalar(lambda bb: nll(m, mu, bb, S, B, n), bounds=(B_LO, B_HI), method="bounded",
-                        options={"xatol": 1e-5})
-    return float(r.fun), float(r.x)
 
 
 def find_minimum(S, B, n):
@@ -200,17 +212,23 @@ def mu_interval(mu_hat, S, B, n, f_min):
 
 def main():
     ds = Path(sys.argv[1]); out = Path(sys.argv[2])
+    model = load_model(HERE / "model.json")
     data = H.load(ds / "data" / "events.npz")
     pool = H.load(ds / "mc" / "pool.npz")
-    n = H.template2d(data, edges=(MT_EDGES, MLL_EDGES)).reshape(-1)
-    S, B = build_templates(pool)
+    # train.py trains on the even-indexed pool events: use the odd ones (weight x2) for templates.
+    odd = np.arange(len(pool["label"])) % 2 == 1
+    pool = H.select(pool, odd)
+    pool["weight"] = pool["weight"] * 2.0
+    edges = (score_edges(), MT_EDGES)
+    n = np.histogram2d(score(model, data), H.kinematics(data)["mt"], edges)[0].reshape(-1)
+    S, B = build_templates(pool, model)
 
     m_hat, mu_hat, b_hat, f_min = find_minimum(S, B, n)
 
     mu_lo, mu_hi = mu_interval(mu_hat, S, B, n, f_min)
     mu_err = 0.5 * (mu_hi - mu_lo)
 
-    ms = np.arange(M_LO, M_HI + 0.01, 1.0)
+    ms = np.arange(M_LO, M_HI + 0.01, 0.5)
     prof = []
     for mm in ms:
         r = minimize(lambda p: nll(mm, p[0], p[1], S, B, n), [mu_hat, b_hat], method="L-BFGS-B",
@@ -245,8 +263,8 @@ def main():
         "significance_obs": z,
         "discovery": bool(z >= 5.0),
         "nuisances": {"hww_bkg_norm": {"value": b_hat, "unc": b_err}},
-        "note": ("profile-likelihood template fit of (m_T, m_ll), signal morphed from the 125 GeV sample; "
-                 f"background normalisation {b_hat:.3f} ± {b_err:.3f}; mass interval [{m_lo:.1f}, {m_hi:.1f}]"),
+        "note": ("profile-likelihood template fit in (network score, m_T), signal morphed from the 125 GeV "
+                 f"sample; background normalisation {b_hat:.3f} ± {b_err:.3f}"),
     }
     out.mkdir(parents=True, exist_ok=True)
     (out / "RESULT.json").write_text(json.dumps(result, indent=1))
