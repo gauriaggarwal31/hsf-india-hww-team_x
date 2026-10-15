@@ -61,10 +61,12 @@ def morph(ev, m):
     return out
 
 
-def template2d(ev, weights=None):
-    """The (m_T, m_ll) histogram of the events on the reference binning."""
+def template2d(ev, weights=None, edges=None):
+    """The (m_T, m_ll) histogram of the events on the binning ``edges`` = (mt_edges, mll_edges)
+    (default: the reference binning)."""
+    mt_edges, mll_edges = edges if edges is not None else (MT_EDGES, MLL_EDGES)
     k = kinematics(ev)
-    h, _, _ = np.histogram2d(k["mt"], k["mll"], [MT_EDGES, MLL_EDGES], weights=weights)
+    h, _, _ = np.histogram2d(k["mt"], k["mll"], [mt_edges, mll_edges], weights=weights)
     return h
 
 
